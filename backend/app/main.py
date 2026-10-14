@@ -16,6 +16,7 @@ from app.mcp_server import github_reader, production_database, weather_api
 from app.security.approvals import ApprovalManager
 from app.security.audit import AuditLogger
 from app.security.interceptor import ShadowGuardInterceptor
+from app.security.ml_models import get_ml_models
 from app.security.registry import TrustRegistry
 from app.security.shadow_state import ShadowStateManager
 from app.security.taint import TaintEngine
@@ -24,10 +25,12 @@ from app.security.taint import TaintEngine
 def configure_app_state(app: FastAPI):
     initialize_database(str(DB_PATH))
     ensure_production_demo_db()
+    ml_models = get_ml_models()
     app.state.db_path = str(DB_PATH)
     app.state.production_db_path = str(PRODUCTION_DB_PATH)
     app.state.event_hub = EventHub()
-    app.state.trust_registry = TrustRegistry(str(DB_PATH))
+    app.state.ml_models = ml_models
+    app.state.trust_registry = TrustRegistry(str(DB_PATH), ml_models=ml_models)
     app.state.taint_engine = TaintEngine(str(DB_PATH))
     app.state.audit_logger = AuditLogger(str(DB_PATH))
     app.state.shadow_state = ShadowStateManager(str(PRODUCTION_DB_PATH))
@@ -46,6 +49,7 @@ def configure_app_state(app: FastAPI):
         audit_logger=app.state.audit_logger,
         event_hub=app.state.event_hub,
         raw_tools=app.state.raw_tools,
+        ml_models=ml_models,
     )
     app.state.app_state = {
         'db_path': str(DB_PATH),
@@ -56,6 +60,7 @@ def configure_app_state(app: FastAPI):
         'approval_manager': app.state.approval_manager,
         'interceptor': app.state.interceptor,
         'raw_tools': app.state.raw_tools,
+        'ml_models': ml_models,
     }
 
 

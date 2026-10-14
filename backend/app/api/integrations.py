@@ -33,11 +33,22 @@ def set_integration(request: Request, settings: IntegrationSettingsRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    trust_details = {
+        'tool_name': settings.name,
+        'trust_zone': zone,
+        'weighted_trust_score': tool.get('weighted_trust_score'),
+        'ml_trust_score': tool.get('ml_trust_score'),
+        'combined_trust_score': tool.get('combined_trust_score'),
+        'ml_classification': tool.get('ml_classification'),
+        'trust_classification': tool.get('trust_classification'),
+        'trust_reason_codes': tool.get('trust_reason_codes', []),
+        'mandatory_override': tool.get('mandatory_override', False),
+    }
     request.app.state.audit_logger.log_event(
         'integration_policy_updated',
         'system',
         f"Integration '{settings.name}' trust zone updated to {zone}",
-        {'tool_name': settings.name, 'trust_zone': zone, 'trust_score': tool.get('trust_score')},
+        trust_details,
         None,
         settings.name,
         'POLICY_UPDATE',
@@ -47,7 +58,7 @@ def set_integration(request: Request, settings: IntegrationSettingsRequest):
         'integration_policy_updated',
         'system',
         f"Integration '{settings.name}' trust zone updated to {zone}.",
-        {'tool_name': settings.name, 'trust_zone': zone},
+        trust_details,
         None,
         settings.name,
         'POLICY_UPDATE',

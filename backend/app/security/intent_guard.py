@@ -17,6 +17,7 @@ deterministic and independent of trust scores and taint state.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from app.security.risk_engine import analyze_sql
@@ -41,6 +42,81 @@ _TOOL_MIN_CAPABILITY: dict[str, str] = {
 
 
 def check_intent(
+    tool_name: str,
+    arguments: dict[str, Any],
+    authorized_capabilities: list[str],
+    user_objective: str = '',
+    ml_classifier: Any = None,
+    proposed_action: dict[str, Any] | None = None,
+    taint_state: str = 'CLEAN',
+    taint_source_count: int = 0,
+) -> dict[str, Any]:
+    result = _check_intent_deterministic(
+        tool_name, arguments, authorized_capabilities, user_objective,
+    )
+    if proposed_action and proposed_action.get('classification') == 'PROHIBITED':
+        ml_result = {
+            'classification': 'UNCERTAIN',
+            'confidence': None,
+            'reason_codes': ['ACTION_PRECLASSIFIED_PROHIBITED'],
+        }
+    elif ml_classifier is None:
+        ml_result = {
+            'classification': 'UNCERTAIN',
+            'confidence': None,
+            'reason_codes': ['INTENT_MODEL_UNAVAILABLE'],
+        }
+    else:
+        try:
+            ml_result = ml_classifier.classify_intent(
+                user_objective,
+                authorized_capabilities,
+                tool_name,
+                proposed_action or {},
+                arguments,
+                taint_state,
+                taint_source_count,
+            )
+        except Exception as exc:
+            ml_result = {
+                'classification': 'UNCERTAIN',
+                'confidence': None,
+                'reason_codes': [f'INTENT_INFERENCE_FAILED:{type(exc).__name__}'],
+            }
+    if not isinstance(ml_result, dict):
+        ml_result = {
+            'classification': 'UNCERTAIN',
+            'confidence': None,
+            'reason_codes': ['INTENT_INFERENCE_FAILED:INVALID_RESULT'],
+        }
+    classification = ml_result.get('classification')
+    confidence = ml_result.get('confidence')
+    try:
+        confidence = None if confidence is None else float(confidence)
+        if confidence is not None and (not math.isfinite(confidence) or not 0 <= confidence <= 1):
+            raise ValueError('invalid confidence')
+    except (TypeError, ValueError, OverflowError):
+        confidence = None
+        classification = 'UNCERTAIN'
+        ml_result['reason_codes'] = ['INTENT_INFERENCE_FAILED:INVALID_CONFIDENCE']
+    if classification not in {'INTENDED', 'POTENTIALLY_UNINTENDED', 'UNCERTAIN'}:
+        classification = 'UNCERTAIN'
+        ml_result['reason_codes'] = ['INTENT_INFERENCE_FAILED:INVALID_CLASSIFICATION']
+    if classification == 'POTENTIALLY_UNINTENDED' and (confidence is None or confidence < 0.55):
+        classification = 'UNCERTAIN'
+        ml_result['reason_codes'] = ['INTENT_MODEL_UNCERTAIN']
+    reason_codes = ml_result.get('reason_codes', [])
+    if not isinstance(reason_codes, list) or not all(isinstance(code, str) for code in reason_codes):
+        reason_codes = ['INTENT_INFERENCE_FAILED:INVALID_REASON_CODES']
+    result['ml_intent'] = {
+        'classification': classification,
+        'confidence': confidence,
+        'reason_codes': reason_codes,
+    }
+    return result
+
+
+def _check_intent_deterministic(
     tool_name: str,
     arguments: dict[str, Any],
     authorized_capabilities: list[str],

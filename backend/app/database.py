@@ -24,7 +24,7 @@ SCHEMA = [
         outbound_permissions_json TEXT NOT NULL DEFAULT '[]',
         approved_relationships_json TEXT NOT NULL DEFAULT '[]',
         trust_score INTEGER NOT NULL DEFAULT 0,
-        trust_classification TEXT NOT NULL DEFAULT 'LOW',
+        trust_classification TEXT NOT NULL DEFAULT 'LOW_TRUST',
         trust_reason TEXT,
         trust_evaluated_at TEXT
     )
@@ -154,7 +154,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         'outbound_permissions_json': "TEXT NOT NULL DEFAULT '[]'",
         'approved_relationships_json': "TEXT NOT NULL DEFAULT '[]'",
         'trust_score': "INTEGER NOT NULL DEFAULT 0",
-        'trust_classification': "TEXT NOT NULL DEFAULT 'LOW'",
+        'trust_classification': "TEXT NOT NULL DEFAULT 'LOW_TRUST'",
         'trust_reason': "TEXT",
         'trust_evaluated_at': "TEXT",
     }
@@ -223,7 +223,7 @@ def seed_defaults(conn: sqlite3.Connection) -> None:
     ]
     for name, trust_zone, description, capabilities, resources, sensitivity, relationships, outbound in defaults:
         score = 90 if trust_zone == 'HIGH' else 55
-        classification = 'HIGH' if score >= 80 else 'LOW'
+        classification = 'HIGH_TRUST' if score >= 70 else 'LOW_TRUST'
         conn.execute(
             """
             INSERT OR IGNORE INTO tool_registry (

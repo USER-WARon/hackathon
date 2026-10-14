@@ -58,6 +58,13 @@ function formatTime(value) {
   }).format(date)
 }
 
+function formatModelScore(value) {
+  const score = Number(value)
+  return value === null || value === undefined || !Number.isFinite(score)
+    ? 'Unavailable'
+    : `${score.toFixed(1)}/100`
+}
+
 function prettyName(value = '') {
   return value.replaceAll('_', ' ')
 }
@@ -696,12 +703,33 @@ function EventRow({ event }) {
   const approved = event.event_type?.includes('approval') && event.event_type !== 'approval_required'
   const tone = blocked ? 'event-red' : approved ? 'event-green' : event.event_type === 'approval_required' ? 'event-amber' : 'event-blue'
   const Icon = blocked ? ShieldAlert : approved ? CheckCircle2 : event.event_type === 'approval_required' ? Clock3 : Activity
+  const details = event.details || {}
+  const isTrustEvent = event.event_type === 'trust_evaluated'
+  const isIntentEvent = event.event_type?.includes('intent') || event.policy_code?.includes('INTENT')
+  const reasonCodes = details.reason_codes || details.trust_reason_codes || details.intent_reason_codes || []
   return (
     <div className="event-row">
       <div className={`event-icon ${tone}`}><Icon size={15} /></div>
       <div className="event-copy">
         <div className="event-title-row"><strong>{event.summary || prettyName(event.event_type)}</strong><time>{formatTime(event.timestamp)}</time></div>
         <p>{prettyName(event.event_type)}{event.tool_name ? ` · ${prettyName(event.tool_name)}` : ''}{event.policy_code ? ` · ${event.policy_code}` : ''}</p>
+        {(isTrustEvent || isIntentEvent) && (
+          <div className="event-model-details">
+            {isTrustEvent ? (
+              <>
+                <span>Trust {details.classification || 'LOW_TRUST'}</span>
+                <span>ML class {details.ml_classification || 'Unavailable'}</span>
+                <span>Weighted {formatModelScore(details.weighted_trust_score)}</span>
+                <span>ML {formatModelScore(details.ml_trust_score)}</span>
+                <span>Combined {formatModelScore(details.combined_trust_score)}</span>
+                {details.mandatory_override && <strong>Mandatory policy override</strong>}
+              </>
+            ) : (
+              <span>Intent {details.classification || details.intent_classification || 'UNCERTAIN'}{details.confidence != null ? ` · ${(details.confidence * 100).toFixed(0)}% confidence` : ''}</span>
+            )}
+            {reasonCodes.length > 0 && <small>{reasonCodes.join(' · ')}</small>}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -822,9 +850,20 @@ function IntegrationCard({ integration, saving, onChange }) {
       </div>
       <p className="integration-description">{integration.description || descriptions[integration.name] || 'Tool registered with the ShadowGuard gateway.'}</p>
       <div className="trust-score-row">
-        <span>Trust score</span>
-        <strong>{integration.trust_score ?? 0}/100</strong>
-        <small>{integration.trust_classification || integration.trust_zone} · {integration.trust_reason || 'No trust evidence recorded'}</small>
+        <span>Trust classification</span>
+        <strong>{integration.trust_classification || 'LOW_TRUST'}</strong>
+        <small>ML classification: {integration.ml_classification || 'Unavailable'}</small>
+        <div className="trust-model-scores">
+          <div><small>Weighted</small><strong>{formatModelScore(integration.weighted_trust_score)}</strong></div>
+          <div><small>ML score</small><strong>{formatModelScore(integration.ml_trust_score)}</strong></div>
+          <div><small>Combined</small><strong>{formatModelScore(integration.combined_trust_score)}</strong></div>
+        </div>
+        {integration.trust_reason_codes?.length > 0 && (
+          <small>Reasons: {integration.trust_reason_codes.join(' · ')}</small>
+        )}
+        {integration.mandatory_override && (
+          <span className="trust-model-override" role="status">Mandatory security check overrode the model score</span>
+        )}
       </div>
       <div className="integration-card-footer">
         <label htmlFor={`zone-${integration.name}`}>Trust zone</label>

@@ -9,6 +9,7 @@ from app.security.action_classifier import classify_action, detect_suspicious_co
 from app.security.audit import AuditLogger
 from app.security.approvals import ApprovalManager
 from app.security.intent_guard import check_intent
+from app.security.ml_models import MLModelRuntime
 from app.security.registry import TrustRegistry
 from app.security.response_guard import ResponseGuard
 from app.security.response_synthesizer import synthesize_error, synthesize_pending
@@ -28,6 +29,7 @@ class ShadowGuardInterceptor:
         audit_logger: AuditLogger,
         event_hub: Any,
         raw_tools: dict[str, Any],
+        ml_models: MLModelRuntime | None = None,
     ):
         self.db_path = db_path
         self.trust_registry = trust_registry
@@ -37,6 +39,7 @@ class ShadowGuardInterceptor:
         self.audit_logger = audit_logger
         self.event_hub = event_hub
         self.raw_tools = raw_tools
+        self.ml_models = ml_models if ml_models is not None else getattr(trust_registry, 'ml_models', None)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -203,20 +206,48 @@ class ShadowGuardInterceptor:
             )
 
         # ---- INTENT_AUTHORIZATION_EVALUATED -------------------------------
+        classification = classify_action(tool_name, arguments, tool)
         intent_result = check_intent(
-            tool_name, arguments, authorized_capabilities, user_objective
+            tool_name,
+            arguments,
+            authorized_capabilities,
+            user_objective,
+            ml_classifier=self.ml_models,
+            proposed_action=classification,
+            taint_state=self.taint_engine.current_state(session_id),
+            taint_source_count=len(inherited_sources),
         )
+        ml_intent = intent_result['ml_intent']
+        safe_intent_details = {
+            'tool_name': tool_name,
+            'allowed': intent_result['allowed'],
+            'required_capability': intent_result.get('required_capability'),
+            'authorized_capabilities': authorized_capabilities,
+            'classification': ml_intent['classification'],
+            'confidence': ml_intent.get('confidence'),
+            'reason_codes': ml_intent.get('reason_codes', []),
+            'action_category': classification.get('operation'),
+            'target_resource': classification.get('target_resource'),
+        }
         self._log(
             'INTENT_AUTHORIZATION_EVALUATED', session_id,
-            f'Intent check for {tool_name}: {"allowed" if intent_result["allowed"] else "denied"}',
+            f'Intent check for {tool_name}: {"allowed" if intent_result["allowed"] else "denied"}; ML {ml_intent["classification"]}',
             {
-                'tool_name': tool_name,
                 'argument_fields': sorted(argument_fields),
-                'authorized_capabilities': authorized_capabilities,
                 'intent_result': intent_result,
                 'user_objective_snippet': user_objective[:120],
+                'action_category': classification.get('operation'),
+                'target_resource': classification.get('target_resource'),
             },
             None, tool_name,
+            None if intent_result['allowed'] else 'INTENT_SCOPE_VIOLATION',
+            request_id=request_id,
+            severity='info' if intent_result['allowed'] else 'warning',
+        )
+        self._emit(
+            'intent_evaluated', session_id,
+            f'Intent evaluation for {tool_name}: {ml_intent["classification"]}',
+            safe_intent_details, None, tool_name,
             None if intent_result['allowed'] else 'INTENT_SCOPE_VIOLATION',
             request_id=request_id,
             severity='info' if intent_result['allowed'] else 'warning',
@@ -236,10 +267,8 @@ class ShadowGuardInterceptor:
             self._emit(
                 'security_error', session_id,
                 'Intent scope violation',
-                {
-                    'tool_name': tool_name,
+                safe_intent_details | {
                     'argument_fields': sorted(argument_fields),
-                    'authorized_capabilities': authorized_capabilities,
                     'policy_reasons': [intent_result.get('reason', '')],
                 },
                 None, tool_name, 'INTENT_SCOPE_VIOLATION',
@@ -255,20 +284,79 @@ class ShadowGuardInterceptor:
                 ),
             )
 
+        if ml_intent['classification'] == 'POTENTIALLY_UNINTENDED':
+            message = 'The proposed action appears misaligned with the original request and was not run.'
+            guidance = 'Confirm the intended target and operation, then submit a request that explicitly describes them.'
+            self._record_provenance(
+                session_id, tool_name, tool_call_id, 'blocked',
+                argument_fields, inherited_sources,
+                policy_code='ML_INTENT_SCOPE_MISMATCH',
+                message=message,
+                guidance=guidance,
+                request_id=request_id,
+            )
+            details = safe_intent_details | {'argument_fields': sorted(argument_fields)}
+            self._log(
+                'ML_INTENT_BLOCKED', session_id, message, details,
+                None, tool_name, 'ML_INTENT_SCOPE_MISMATCH',
+                request_id=request_id, severity='warning',
+            )
+            self._emit(
+                'security_error', session_id, message, details,
+                None, tool_name, 'ML_INTENT_SCOPE_MISMATCH',
+                request_id=request_id, severity='warning',
+            )
+            return synthesize_error('ML_INTENT_SCOPE_MISMATCH', message, guidance)
+
         # ---- TRUST_EVALUATED ----------------------------------------------
         trust_evaluation = self.trust_registry.evaluate_trust(tool)
+        effective_tool_zone = (
+            'LOW'
+            if trust_evaluation['classification'] == 'LOW_TRUST'
+            else tool['trust_zone']
+        )
         self._log(
             'TRUST_EVALUATED', session_id,
             f'Trust evaluated for {tool_name}: {trust_evaluation["classification"]}',
             {
                 'tool_name': tool_name,
                 'score': trust_evaluation['score'],
+                'weighted_trust_score': trust_evaluation['weighted_trust_score'],
+                'ml_trust_score': trust_evaluation['ml_trust_score'],
+                'combined_trust_score': trust_evaluation['combined_trust_score'],
+                'ml_classification': trust_evaluation['ml_classification'],
                 'classification': trust_evaluation['classification'],
+                'configured_trust_zone': tool['trust_zone'],
+                'effective_tool_trust_zone': effective_tool_zone,
+                'reason_codes': trust_evaluation['reason_codes'],
+                'mandatory_checks_passed': trust_evaluation['mandatory_checks_passed'],
+                'mandatory_override': trust_evaluation['mandatory_override'],
                 'hard_deny': trust_evaluation['hard_deny'],
                 'reason': trust_evaluation['reason'],
             },
             None, tool_name, None,
             request_id=request_id, severity='info',
+        )
+        trust_event_details = {
+            'tool_name': tool_name,
+            'weighted_trust_score': trust_evaluation['weighted_trust_score'],
+            'ml_trust_score': trust_evaluation['ml_trust_score'],
+            'combined_trust_score': trust_evaluation['combined_trust_score'],
+            'ml_classification': trust_evaluation['ml_classification'],
+            'classification': trust_evaluation['classification'],
+            'configured_trust_zone': tool['trust_zone'],
+            'effective_tool_trust_zone': effective_tool_zone,
+            'reason_codes': trust_evaluation['reason_codes'],
+            'mandatory_checks_passed': trust_evaluation['mandatory_checks_passed'],
+            'mandatory_override': trust_evaluation['mandatory_override'],
+            'hard_deny': trust_evaluation['hard_deny'],
+        }
+        self._emit(
+            'trust_evaluated', session_id,
+            f'Trust evaluated for {tool_name}: {trust_evaluation["classification"]}',
+            trust_event_details, None, tool_name,
+            'MANDATORY_SECURITY_OVERRIDE' if trust_evaluation['mandatory_override'] else None,
+            request_id=request_id, severity='warning' if trust_evaluation['mandatory_override'] else 'info',
         )
         if trust_evaluation['hard_deny']:
             summary = f'Hard-deny policy blocked {tool_name}: {trust_evaluation["reason"]}'
@@ -290,14 +378,14 @@ class ShadowGuardInterceptor:
             return synthesize_error('HARD_DENY', summary, 'This policy cannot be overridden by approval.')
 
         # ---- ARGUMENTS_VALIDATED / POLICY_DECISION ------------------------
-        classification = classify_action(tool_name, arguments, tool)
-
         # Full policy details for the audit log (backend-only, acceptable for forensics).
         policy_details = {
             'tool_name': tool_name,
             'arguments': arguments,
             'trust_score': trust_evaluation['score'],
             'trust_classification': trust_evaluation['classification'],
+            'trust_evaluation': trust_evaluation,
+            'intent_evaluation': ml_intent,
             'action_classification': classification,
         }
         # Safe subset for the WebSocket event stream.
@@ -306,6 +394,14 @@ class ShadowGuardInterceptor:
             'argument_fields': sorted(arguments),
             'trust_score': trust_evaluation['score'],
             'trust_classification': trust_evaluation['classification'],
+            'weighted_trust_score': trust_evaluation['weighted_trust_score'],
+            'ml_trust_score': trust_evaluation['ml_trust_score'],
+            'combined_trust_score': trust_evaluation['combined_trust_score'],
+            'trust_reason_codes': trust_evaluation['reason_codes'],
+            'mandatory_override': trust_evaluation['mandatory_override'],
+            'intent_classification': ml_intent['classification'],
+            'intent_confidence': ml_intent.get('confidence'),
+            'intent_reason_codes': ml_intent.get('reason_codes', []),
             'policy_reasons': classification.get('reasons', []),
         }
 
@@ -376,7 +472,7 @@ class ShadowGuardInterceptor:
             return synthesize_pending(action['approval_id'], action['approval_id'], message, policy_details_safe)
 
         # ---- PROVENANCE_EVALUATED -----------------------------------------
-        allowed, code = self.taint_engine.can_access_tool(session_id, tool['trust_zone'])
+        allowed, code = self.taint_engine.can_access_tool(session_id, effective_tool_zone)
         taint_state = self.taint_engine.current_state(session_id)
         self._log(
             'PROVENANCE_EVALUATED', session_id,
@@ -385,7 +481,8 @@ class ShadowGuardInterceptor:
                 'tool_name': tool_name,
                 'session_taint_state': taint_state,
                 'taint_sources': inherited_sources,
-                'tool_trust_zone': tool['trust_zone'],
+                'tool_trust_zone': effective_tool_zone,
+                'configured_tool_trust_zone': tool['trust_zone'],
                 'allowed': allowed,
                 'code': code,
             },
@@ -662,7 +759,7 @@ class ShadowGuardInterceptor:
                        request_id=request_id, severity='warning')
 
         tool_result_fields = list(raw_result) if isinstance(raw_result, dict) else list(result)
-        if tool['trust_zone'] == 'LOW' and result.get('status') != 'error' and not result.get('isError'):
+        if effective_tool_zone == 'LOW' and result.get('status') != 'error' and not result.get('isError'):
             self.taint_engine.mark_tainted(session_id, tool_name, tool_call_id, tool_result_fields)
             self._log('taint_updated', session_id,
                       'Session tainted by low-trust tool result',

@@ -32,3 +32,7 @@ Check `http://127.0.0.1:8000/api/health`, then send a POST request to
 `{"message":"Hello","user_id":"demo-user"}`. A successful response includes
 `response`, `status`, `approval_id`, `session_id`, `state`, and `provenance`.
 Protected operations remain subject to ShadowGuard policy and human approval.
+
+The ML trust and intent signals use saved synthetic-demonstration models. See
+[`docs/ml-security-models.md`](../docs/ml-security-models.md) for training,
+evaluation metrics, configuration, and limitations.
